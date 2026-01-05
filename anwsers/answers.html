@@ -27,6 +27,7 @@
         .instruction { font-size: 14px; line-height: 1.8; color: #888; border-left: 2px solid #444; padding-left: 15px; }
         .key { color: #4ff; font-weight: bold; }
         #status-text { color: #ccc; letter-spacing: 1px; font-weight: bold; }
+        #gesture-hint { color: #ff8844; font-size: 12px; margin-top: 10px; display: none; }
 
         @keyframes pulse { 0% { opacity: 0.7; } 50% { opacity: 1; } 100% { opacity: 0.7; } }
 
@@ -57,7 +58,9 @@
         <div class="instruction">
             <p> <span class="key">⇄ NAVIGATE</span> 右手悬停移动</p>
             <p> <span class="key">✋ ACTIVATE</span> 张开手掌蓄力</p>
+            <p> <span class="key">✊ RESET</span> 右手握拳重置</p>
             <p>STATUS: <span id="status-text">WAITING FOR UPLINK...</span></p>
+            <p id="gesture-hint">右手握拳以重新选择</p>
         </div>
     </div>
 
@@ -73,11 +76,17 @@
             cardCount: 12,
             cardSpacing: 3.2, 
             chargeTimeNeed: 50, 
-            colors: { bg: 0x020205, cursor: 0x44ffff, cursorActive: 0xffffff } 
+            colors: { bg: 0x020205, cursor: 0x44ffff, cursorActive: 0xffffff },
+            resetFistTime: 40, // 握拳持续帧数阈值
+            fistDetectionThreshold: 0.7 // 握拳检测阈值（手指弯曲程度）
         };
 
         const input = { x: 0.5, y: 0.5, isPalmOpen: false, isDetected: false };
+        
         let scrollTarget = 0, scrollCurrent = 0, pinchTimer = 0, activeCardIndex = 0, explosionParticles; 
+        let resetFistTimer = 0; // 握拳计时器
+        let rightHandDetected = false; // 右手是否被检测到
+        let isRightFist = false; // 右手是否握拳
         const clock = new THREE.Clock(); 
 
         // --- Scene & Bloom ---
@@ -110,6 +119,13 @@
         const cursor = new THREE.Mesh(cursorGeo, cursorMat);
         cursor.position.z = 5;
         scene.add(cursor);
+
+        // 添加握拳指示器
+        const fistIndicatorGeo = new THREE.SphereGeometry(0.3, 16, 16);
+        const fistIndicatorMat = new THREE.MeshBasicMaterial({ color: 0xff4444, transparent: true, opacity: 0, depthTest: false, blending: THREE.AdditiveBlending });
+        const fistIndicator = new THREE.Mesh(fistIndicatorGeo, fistIndicatorMat);
+        fistIndicator.position.z = 5;
+        scene.add(fistIndicator);
 
         const chargeGeo = new THREE.RingGeometry(0.12, 0.16, 64, 1, 0, 0);
         const chargeMat = new THREE.MeshBasicMaterial({ color: 0xff0044, side: THREE.DoubleSide, transparent: true, opacity: 0.9, depthTest: false, blending: THREE.AdditiveBlending });
@@ -291,6 +307,203 @@
         // --- Logic ---
         let gameState = 'IDLE'; 
 
+        // 新增：检测右手是否握拳
+        function isRightHandFist(landmarks) {
+            if (!landmarks) return false;
+            
+            // 检测手指是否弯曲（指尖在指关节下方）
+            const fingerPairs = [
+                [8, 6],  // 食指
+                [12, 10], // 中指
+                [16, 14], // 无名指
+                [20, 18]  // 小指
+            ];
+            
+            let bentFingers = 0;
+            
+            for (let i = 0; i < fingerPairs.length; i++) {
+                const [tipIdx, pipIdx] = fingerPairs[i];
+                const tip = landmarks[tipIdx];
+                const pip = landmarks[pipIdx];
+                
+                // 在垂直方向上，指尖在指关节下方表示弯曲
+                if (tip.y > pip.y) {
+                    bentFingers++;
+                }
+            }
+            
+            // 检测拇指是否弯曲（拇指尖在拇指关节下方）
+            const thumbTip = landmarks[4];
+            const thumbIP = landmarks[3];
+            if (thumbTip.y > thumbIP.y) {
+                bentFingers++;
+            }
+            
+            // 如果至少4个手指弯曲（包括拇指），则认为是握拳
+            return bentFingers >= 4;
+        }
+
+        // 新增：检测右手是否张开
+        function isRightHandOpen(landmarks) {
+            if (!landmarks) return false;
+            
+            const fingerPairs = [
+                [8, 6],  // 食指
+                [12, 10], // 中指
+                [16, 14], // 无名指
+                [20, 18]  // 小指
+            ];
+            
+            let extendedFingers = 0;
+            
+            for (let i = 0; i < fingerPairs.length; i++) {
+                const [tipIdx, pipIdx] = fingerPairs[i];
+                const tip = landmarks[tipIdx];
+                const pip = landmarks[pipIdx];
+                
+                // 在垂直方向上，指尖在指关节上方表示伸直
+                if (tip.y < pip.y) {
+                    extendedFingers++;
+                }
+            }
+            
+            // 检测拇指是否张开
+            const thumbTip = landmarks[4];
+            const thumbIP = landmarks[3];
+            if (thumbTip.y < thumbIP.y) {
+                extendedFingers++;
+            }
+            
+            // 如果至少4个手指伸直（包括拇指），则认为是张开
+            return extendedFingers >= 4;
+        }
+
+        // 新增：检测右手是否握拳来重置
+        function checkFistResetGesture() {
+            // 只有在揭示状态才检查重置手势
+            if (gameState !== 'REVEALED') {
+                fistIndicator.material.opacity = 0;
+                return;
+            }
+            
+            // 显示提示
+            document.getElementById('gesture-hint').style.display = 'block';
+            
+            // 更新握拳指示器位置到右手位置（如果右手被检测到）
+            if (rightHandDetected && input.isDetected) {
+                fistIndicator.position.x = cursor.position.x;
+                fistIndicator.position.y = cursor.position.y;
+                fistIndicator.position.z = cursor.position.z;
+            }
+            
+            // 检测握拳
+            if (isRightFist && rightHandDetected) {
+                resetFistTimer++;
+                
+                // 握拳指示器反馈
+                const progress = Math.min(resetFistTimer / CONF.resetFistTime, 1);
+                fistIndicator.material.opacity = progress * 0.7;
+                fistIndicator.scale.setScalar(1 + Math.sin(clock.getElapsedTime() * 5) * 0.1 * progress);
+                
+                // 握拳持续时间足够
+                if (resetFistTimer > CONF.resetFistTime) {
+                    // 触发重置
+                    resetScene();
+                    resetFistTimer = 0;
+                    fistIndicator.material.opacity = 0;
+                } else {
+                    // 显示握拳进度
+                    document.getElementById('status-text').innerText = `FIST HELD... ${Math.floor(progress * 100)}%`;
+                    document.getElementById('status-text').style.color = "#ff4444";
+                }
+            } else {
+                // 不是握拳状态，重置计时器
+                resetFistTimer = Math.max(0, resetFistTimer - 2);
+                fistIndicator.material.opacity = resetFistTimer / CONF.resetFistTime * 0.3;
+                
+                // 如果之前是握拳状态但现在不是，恢复状态文本
+                if (resetFistTimer > 0) {
+                    document.getElementById('status-text').innerText = "FATE SEALED.";
+                }
+            }
+        }
+
+        // 新增：重置场景函数
+        function resetScene() {
+            gameState = 'RESETTING';
+            document.getElementById('status-text').innerText = "RESETTING FATE...";
+            
+            // 添加重置特效
+            gsap.to(bloomPass, { strength: 2.5, radius: 1.0, duration: 0.2, yoyo: true, repeat: 1 });
+            
+            // 隐藏最终文字
+            gsap.to(finalTextMat, { 
+                opacity: 0, 
+                duration: 0.5, 
+                onComplete: () => {
+                    finalTextPlane.visible = false;
+                }
+            });
+            
+            // 恢复UI层
+            gsap.to(document.getElementById('ui-layer'), { opacity: 1, duration: 0.5 });
+            
+            // 显示光标
+            cursor.visible = true;
+            
+            // 恢复所有卡牌
+            cards.forEach((card, index) => {
+                card.visible = true;
+                
+                // 计算卡牌的预期位置
+                let realX = (card.userData.baseX + scrollCurrent) % (CONF.cardCount * CONF.cardSpacing);
+                if (realX > CONF.cardCount * CONF.cardSpacing / 2) realX -= CONF.cardCount * CONF.cardSpacing;
+                if (realX < -CONF.cardCount * CONF.cardSpacing / 2) realX += CONF.cardCount * CONF.cardSpacing;
+                
+                gsap.to(card.position, { 
+                    x: realX,
+                    y: Math.sin(clock.getElapsedTime() * 2 + index) * 0.05 - 0.5,
+                    z: 0,
+                    duration: 1.2,
+                    ease: "power3.out"
+                });
+                
+                gsap.to(card.scale, { 
+                    x: 1, 
+                    y: 1, 
+                    duration: 1.0,
+                    ease: "back.out(1.2)"
+                });
+                
+                gsap.to(card.rotation, { 
+                    x: 0, 
+                    y: 0, 
+                    z: 0, 
+                    duration: 1.0
+                });
+                
+                // 恢复透明度
+                card.children.forEach(mesh => {
+                    gsap.to(mesh.material, { 
+                        opacity: 1, 
+                        duration: 0.8 
+                    });
+                });
+            });
+            
+            // 重置爆炸粒子
+            explosionParticles.userData.isActive = false;
+            gsap.to(explosionParticles.material, { opacity: 0, duration: 0.3 });
+            
+            // 重置状态
+            setTimeout(() => {
+                gameState = 'IDLE';
+                document.getElementById('status-text').innerText = input.isDetected ? "LINKED - OPEN PALM TO SELECT" : "SEARCHING FOR SIGNAL...";
+                document.getElementById('gesture-hint').style.display = 'none';
+                document.getElementById('status-text').style.color = "#fff";
+            }, 1200);
+        }
+
         function updateLogic() {
             const time = clock.getElapsedTime();
 
@@ -307,7 +520,12 @@
             const scalePulse = 1 + Math.sin(time * 3) * 0.05;
             cursor.scale.setScalar(scalePulse);
 
-            if (gameState === 'REVEALED') { updateExplosion(); return; }
+            // 在揭示状态检查握拳重置手势
+            if (gameState === 'REVEALED') { 
+                updateExplosion(); 
+                checkFistResetGesture();
+                return; 
+            }
 
             const speed = (input.x - 0.5) * 0.7;
             
@@ -456,24 +674,35 @@
         hands.onResults(results => {
             input.isDetected = false; 
             input.isPalmOpen = false;
+            rightHandDetected = false;
+            isRightFist = false;
+            
             if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
                 for (let i = 0; i < results.multiHandedness.length; i++) {
                     const label = results.multiHandedness[i].label;
+                    const lm = results.multiHandLandmarks[i];
+                    
                     if (label === 'Left') { 
+                        // 右手控制光标
                         input.isDetected = true;
-                        const lm = results.multiHandLandmarks[i]; 
-                        const i8 = lm[8];
+                        rightHandDetected = true;
+                        const i8 = lm[8]; // 食指指尖
                         input.x += ((1 - i8.x) - input.x) * 0.5; 
                         input.y += (i8.y - input.y) * 0.5;
 
-                        const tips = [8, 12, 16, 20];
-                        const pips = [6, 10, 14, 18]; 
+                        // 检测手掌张开
+                        const tips = [8, 12, 16, 20]; // 指尖索引
+                        const pips = [6, 10, 14, 18]; // 对应指关节索引
                         let extendedCount = 0;
-                        for (let k = 0; k < 4; k++) { if (lm[tips[k]].y < lm[pips[k]].y) extendedCount++; }
-                        if (Math.abs(lm[4].x - lm[2].x) > 0.03) extendedCount++;
-
+                        for (let k = 0; k < 4; k++) { 
+                            if (lm[tips[k]].y < lm[pips[k]].y) extendedCount++; 
+                        }
+                        if (Math.abs(lm[4].x - lm[2].x) > 0.03) extendedCount++; // 拇指
                         input.isPalmOpen = (extendedCount >= 4);
-                        break; 
+                        
+                        // 检测是否握拳
+                        isRightFist = isRightHandFist(lm);
+                        
                     }
                 }
             }
